@@ -397,8 +397,41 @@ pub async fn q_history(
     with_meta: bool,
     debug_source: bool,
 ) -> Result<Value> {
-    let username =
-        resolve_username(chat, names).with_context(|| format!("找不到联系人: {}", chat))?;
+    // `wx sessions` 会列出一些没有联系人记录的占位/系统会话（如
+    // brandservicesessionholder、企业微信 *@qy_g 实体）。satellite 的 wechat pack
+    // 会对每个会话 username 原样调用 `wx history`；对这类无法解析成联系人的 username
+    // 返回空结果（exit 0）而非报错，避免整轮同步因一个占位会话而失败。交互式使用时，
+    // 对一个无法解析的名字返回 count:0 也比硬报错更不突兀。
+    let username = match resolve_username(chat, names) {
+        Some(u) => u,
+        None => {
+            let windowed = since.is_some()
+                || until.is_some()
+                || after_ts.is_some()
+                || before_ts.is_some()
+                || msg_type.is_some();
+            let unknown_shards = current_unknown_shards(db, names);
+            let meta = meta_for_shards(
+                0,
+                &[],
+                0,
+                unknown_shards,
+                None,
+                windowed,
+                with_meta,
+                debug_source,
+            );
+            return Ok(json!({
+                "chat": chat,
+                "username": chat,
+                "is_group": false,
+                "chat_type": "unknown",
+                "count": 0,
+                "messages": [],
+                "meta": meta,
+            }));
+        }
+    };
     let display = names.display(&username);
     let chat_type = chat_type_of(&username, names);
     let is_group = chat_type == "group";
@@ -418,7 +451,37 @@ pub async fn q_history(
     // 按时间路由分片：避免为「最近 N 条」解密全部 message_*.db
     let (shards, scanned) = find_msg_shards(db, names, &username, eff_since, eff_until).await?;
     if shards.is_empty() {
-        anyhow::bail!("找不到 {} 的消息记录", display);
+        // 联系人存在、但在该（可能被时间窗/游标收紧的）范围内没有任何消息分片。
+        // 这不是错误：返回空的 messages 列表（exit 0），让上层调用方（如
+        // personal-system-satellite 的 wechat pack：它对每个私聊都带 --since 调用
+        // `wx history`）能正常把「本窗口无新消息」当作空结果处理，而不是让整轮
+        // 同步因第一个久未联系的联系人而失败。
+        let windowed = since.is_some()
+            || until.is_some()
+            || after_ts.is_some()
+            || before_ts.is_some()
+            || msg_type.is_some();
+        let unknown_shards = current_unknown_shards(db, names);
+        let session_ts = session_last_timestamp(db, &username).await;
+        let meta = meta_for_shards(
+            scanned,
+            &shards,
+            0,
+            unknown_shards,
+            session_ts,
+            windowed,
+            with_meta,
+            debug_source,
+        );
+        return Ok(json!({
+            "chat": display,
+            "username": username,
+            "is_group": is_group,
+            "chat_type": chat_type,
+            "count": 0,
+            "messages": [],
+            "meta": meta,
+        }));
     }
 
     let mut all_msgs: Vec<Value> = Vec::new();
