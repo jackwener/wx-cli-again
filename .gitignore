@@ -28,3 +28,6 @@ __pycache__/
 Thumbs.db
 find_all_keys_macos
 .claude/worktrees/
+
+# Claude Code 本地配置（含审批命令原文，勿提交）
+.claude/settings.local.json
