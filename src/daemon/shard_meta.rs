@@ -33,6 +33,13 @@ pub struct ShardMetaEntry {
     /// 加密源文件 mtime（纳秒），用于判断是否过期
     #[serde(default)]
     pub source_mtime_ns: u64,
+    /// 加密源 WAL（`<db>-wal`）mtime（纳秒）。
+    ///
+    /// 微信写入新消息时只追加 WAL，主库 mtime 可能长时间不变；只看主库 mtime
+    /// 会把「已有新消息」的 meta 误判为新鲜，导致窄时间窗查询跳过整个分片
+    /// （表现为 `找不到 xxx 的消息记录`）。见 `may_overlap`。
+    #[serde(default)]
+    pub wal_mtime_ns: u64,
     /// 是否确认某 talker 表不存在（可选加速，key 为 table name）
     #[serde(default)]
     pub missing_tables: Vec<String>,
@@ -91,13 +98,29 @@ pub fn source_mtime_ns(path: &Path) -> u64 {
         .unwrap_or(0)
 }
 
+/// SQLite 的 `-wal` 附属文件路径（`message_0.db` → `message_0.db-wal`）。
+pub fn wal_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push("-wal");
+    PathBuf::from(name)
+}
+
+/// 主库 + WAL 的当前 mtime（纳秒）。
+pub fn source_mtimes(path: &Path) -> (u64, u64) {
+    (source_mtime_ns(path), source_mtime_ns(&wal_path(path)))
+}
+
 /// 判断分片是否可能与 [since, until] 时间窗重叠。
 ///
 /// 必须传入 `table`（`Msg_<md5>`）。只用该表的 bound；未知表则保守返回 true。
-/// meta 缺失或源文件 mtime 更新时返回 true。
+/// meta 缺失、主库 mtime 或 WAL mtime 更新时返回 true。
+///
+/// WAL 也必须参与新鲜度判断：微信收新消息只追加 `-wal`，主库 mtime 可能不变，
+/// 否则会把滞后 per-table 界当成有效界，窄时间窗查询会错误跳过整个分片。
 pub fn may_overlap(
     entry: Option<&ShardMetaEntry>,
     source_mtime: u64,
+    wal_mtime: u64,
     table: &str,
     since: Option<i64>,
     until: Option<i64>,
@@ -105,8 +128,11 @@ pub fn may_overlap(
     let Some(e) = entry else {
         return true;
     };
-    // 源文件已更新 → meta 可能过期
+    // 主库或 WAL 已更新 → meta 可能过期
     if e.source_mtime_ns > 0 && source_mtime > e.source_mtime_ns {
+        return true;
+    }
+    if wal_mtime > 0 && (e.wal_mtime_ns == 0 || wal_mtime > e.wal_mtime_ns) {
         return true;
     }
     // 已知缺失
@@ -146,7 +172,9 @@ pub fn record_open(
     shard_start: Option<i64>,
 ) {
     let e = meta.shards.entry(rel_key.to_string()).or_default();
-    e.source_mtime_ns = source_mtime_ns(source_path);
+    let (db_mtime, wal_mtime) = source_mtimes(source_path);
+    e.source_mtime_ns = db_mtime;
+    e.wal_mtime_ns = wal_mtime;
     if shard_start.is_some() {
         e.shard_start = shard_start;
     }
@@ -213,6 +241,7 @@ mod tests {
         assert!(may_overlap(
             e,
             0,
+            0,
             "Msg_bbb",
             Some(1_600_000_000),
             Some(1_600_000_100)
@@ -220,6 +249,7 @@ mod tests {
         // known table outside window → skip
         assert!(!may_overlap(
             e,
+            0,
             0,
             "Msg_aaa",
             Some(1_600_000_000),
@@ -229,9 +259,62 @@ mod tests {
         assert!(may_overlap(
             e,
             0,
+            0,
             "Msg_aaa",
             Some(1_700_000_000),
             Some(1_700_000_050)
+        ));
+    }
+
+    /// 回归测试：消息只进 WAL、主库 mtime 未变时，不能用滞后的 per-table 界跳过分片。
+    /// 症状是窄时间窗 history 误报「找不到 xxx 的消息记录」。
+    #[test]
+    fn wal_growth_invalidates_stale_table_bounds() {
+        let mut meta = ShardMetaFile::default();
+        let path = PathBuf::from("/tmp/nonexistent-for-meta-test");
+        record_open(
+            &mut meta,
+            "message/message_0.db",
+            &path,
+            "Msg_aaa",
+            Some(1_700_000_000),
+            Some(1_700_000_100),
+            None,
+        );
+        // record_open 对不存在的文件记录 mtime=0；模拟「主库 mtime 未变」：
+        let e = meta.shards.get_mut("message/message_0.db").unwrap();
+        e.source_mtime_ns = 1_700_000_500;
+        e.wal_mtime_ns = 1_700_000_500;
+        let e: &ShardMetaEntry = e;
+
+        let since = Some(1_700_000_900);
+        let until = Some(1_700_001_000);
+        // 主库 mtime 没变、WAL 也没变 → 缓存可信，可跳过
+        assert!(!may_overlap(
+            Some(e),
+            1_700_000_500,
+            1_700_000_500,
+            "Msg_aaa",
+            since,
+            until
+        ));
+        // WAL 变新（有新消息）→ 必须重新打开
+        assert!(may_overlap(
+            Some(e),
+            1_700_000_500,
+            1_700_000_950,
+            "Msg_aaa",
+            since,
+            until
+        ));
+        // 主库 mtime 变新 → 必须重新打开
+        assert!(may_overlap(
+            Some(e),
+            1_700_000_950,
+            1_700_000_500,
+            "Msg_aaa",
+            since,
+            until
         ));
     }
 }

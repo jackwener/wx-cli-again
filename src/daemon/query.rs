@@ -418,7 +418,11 @@ pub async fn q_history(
     // 按时间路由分片：避免为「最近 N 条」解密全部 message_*.db
     let (shards, scanned) = find_msg_shards(db, names, &username, eff_since, eff_until).await?;
     if shards.is_empty() {
-        anyhow::bail!("找不到 {} 的消息记录", display);
+        anyhow::bail!(
+            "找不到 {} 的消息记录（已扫描 {} 个消息分片）",
+            display,
+            scanned
+        );
     }
 
     let mut all_msgs: Vec<Value> = Vec::new();
@@ -1310,25 +1314,48 @@ async fn find_msg_shards(
     let mut results: Vec<MessageShard> = Vec::new();
     let mut meta_dirty = false;
 
-    for rel_key in &ordered {
-        let src_path = db
-            .db_dir()
-            .join(rel_key.replace('/', std::path::MAIN_SEPARATOR_STR));
-        let src_mtime = super::shard_meta::source_mtime_ns(&src_path);
-        let entry = meta_file.shards.get(rel_key);
-        if !super::shard_meta::may_overlap(entry, src_mtime, &table_name, since, until) {
-            continue;
+    // 两趟：先用 meta 快速路由；若整趟都没命中，则忽略时间元数据强制重扫一遍。
+    // 元数据只是加速手段，不能因为滞后导致「有消息却报找不到」。
+    for attempt in 0..2 {
+        let force = attempt == 1;
+        if force {
+            eprintln!(
+                "[shard] 时间元数据未命中表 {}，强制重扫 {} 个消息分片",
+                table_name,
+                ordered.len()
+            );
         }
-        if entry
-            .map(|e| e.missing_tables.iter().any(|t| t == &table_name))
-            .unwrap_or(false)
-            && entry
-                .map(|e| e.source_mtime_ns == src_mtime || e.source_mtime_ns == 0)
-                .unwrap_or(false)
-        {
-            // 上次确认该 talker 表不在此分片，且源文件未变
-            continue;
-        }
+
+        for rel_key in &ordered {
+            let src_path = db
+                .db_dir()
+                .join(rel_key.replace('/', std::path::MAIN_SEPARATOR_STR));
+            let (src_mtime, wal_mtime) = super::shard_meta::source_mtimes(&src_path);
+            let entry = meta_file.shards.get(rel_key);
+            if !force && !super::shard_meta::may_overlap(
+                entry,
+                src_mtime,
+                wal_mtime,
+                &table_name,
+                since,
+                until,
+            ) {
+                continue;
+            }
+            if !force
+                && entry
+                    .map(|e| e.missing_tables.iter().any(|t| t == &table_name))
+                    .unwrap_or(false)
+                && entry
+                    .map(|e| {
+                        (e.source_mtime_ns == src_mtime || e.source_mtime_ns == 0)
+                            && e.wal_mtime_ns == wal_mtime
+                    })
+                    .unwrap_or(false)
+            {
+                // 上次确认该 talker 表不在此分片，且主库/WAL 都未变
+                continue;
+            }
 
         let opened = match db.open_query_conn(rel_key).await? {
             Some(v) => v,
@@ -1416,6 +1443,12 @@ async fn find_msg_shards(
                 max_ts: ts,
                 cache_mode,
             });
+        }
+        }
+
+        // 有命中就结束；第二趟（force）无论结果如何都结束
+        if !results.is_empty() || force {
+            break;
         }
     }
 
