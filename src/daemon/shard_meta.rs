@@ -73,10 +73,7 @@ pub fn save(meta: &ShardMetaFile) {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     if let Ok(json) = serde_json::to_string_pretty(&out) {
-        let tmp = path.with_extension("json.tmp");
-        if std::fs::write(&tmp, json).is_ok() {
-            let _ = std::fs::rename(tmp, path);
-        }
+        let _ = crate::private_fs::write_private(&path, json);
     }
 }
 

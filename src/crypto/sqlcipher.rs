@@ -83,3 +83,33 @@ mod tests {
         assert!(err.to_string().contains("64"));
     }
 }
+
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+
+    #[test]
+    fn bundled_database_engine_contains_wal_page_size_fix() {
+        assert!(rusqlite::version_number() >= 3_054_000);
+        let conn = Connection::open_in_memory().unwrap();
+        let cipher: String = conn.query_row("PRAGMA cipher_version", [], |r| r.get(0)).unwrap();
+        assert!(!cipher.is_empty(), "the build must still use SQLCipher");
+    }
+
+    #[test]
+    fn upgraded_sqlcipher_reads_raw_keys_and_live_wal_without_allowing_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("encrypted.db");
+        let key = "23".repeat(32);
+        let writer = Connection::open(&path).unwrap();
+        writer.execute_batch(&format!(
+            "PRAGMA key = \"x'{}'\"; PRAGMA journal_mode = WAL;              CREATE TABLE messages(body TEXT); INSERT INTO messages VALUES ('synthetic message');", key
+        )).unwrap();
+        let reader = open_encrypted_readonly(&path, &key).unwrap();
+        let body: String = reader.query_row("SELECT body FROM messages", [], |r| r.get(0)).unwrap();
+        assert_eq!(body, "synthetic message");
+        assert!(reader.execute("INSERT INTO messages VALUES ('must not write')", []).is_err());
+        assert!(open_encrypted_readonly(&path, &"42".repeat(32)).is_err());
+        assert!(!std::fs::read(&path).unwrap().starts_with(b"SQLite format 3"));
+    }
+}

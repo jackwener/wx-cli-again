@@ -404,8 +404,7 @@ async fn reload_config(
     use crate::config;
 
     let cfg = config::load_config()?;
-    let keys_content = tokio::fs::read_to_string(&cfg.keys_file)
-        .await
+    let keys_content = crate::private_fs::read_private(&cfg.keys_file)
         .map_err(|e| anyhow::anyhow!("读取密钥文件 {:?} 失败: {}", cfg.keys_file, e))?;
     let keys_raw: serde_json::Value = serde_json::from_str(&keys_content)?;
     let all_keys = extract_keys(&keys_raw);

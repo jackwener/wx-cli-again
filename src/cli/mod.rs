@@ -450,6 +450,9 @@ pub fn run() {
 }
 
 fn dispatch(cli: Cli) -> Result<()> {
+    if !matches!(&cli.command, Commands::Init { .. } | Commands::Key { action: KeyAction::Extract { .. } }) {
+        crate::private_fs::require_unprivileged()?;
+    }
     let base_with_meta = cli.with_meta;
     let base_debug_source = cli.debug_source;
     match cli.command {

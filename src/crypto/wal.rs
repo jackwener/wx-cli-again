@@ -31,10 +31,7 @@ pub fn apply_wal(wal_path: &Path, out_path: &Path, enc_key: &[u8; 32]) -> Result
     let frame_area = &wal_data[WAL_HDR_SZ..];
 
     // 打开输出文件做随机写
-    let mut db_file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(out_path)?;
+    let mut db_file = crate::private_fs::open_existing_for_update(out_path)?;
 
     let mut pos = 0usize;
     while pos + frame_size <= frame_area.len() {

@@ -93,7 +93,7 @@ pub fn cmd_export(
 
     match output {
         Some(path) => {
-            std::fs::write(&path, &text)?;
+            crate::private_fs::write_private(std::path::Path::new(&path), &text)?;
             println!("已导出 {} 条消息到 {}", count, path);
         }
         None => println!("{}", text),

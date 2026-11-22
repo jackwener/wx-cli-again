@@ -18,7 +18,7 @@ path = "src/main.rs"
 clap = { version = "4", features = ["derive"] }
 
 # 异步
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.53.3", features = ["full"] }
 
 # 序列化
 serde = { version = "1", features = ["derive"] }
@@ -26,7 +26,7 @@ serde_json = "=1.0.140"
 serde_yaml = "0.9"
 
 # SQLite + SQLCipher（在线打开加密 WeChat DB，避免全量解密）
-rusqlite = { version = "0.31", features = ["bundled-sqlcipher-vendored-openssl"] }
+rusqlite = { version = "0.43", default-features = false, features = ["bundled-sqlcipher-vendored-openssl"] }
 
 # 加密
 aes = "0.8"
@@ -36,10 +36,13 @@ sha2 = "0.10"
 pbkdf2 = "0.12"
 
 # 解压
-zstd = "0.13"
+zstd = "0.13.4"
+
+# 原子写入密钥和安全临时文件
+tempfile = "3"
 
 # 错误处理
-anyhow = "1"
+anyhow = "1.0.103"
 
 # 时间
 chrono = { version = "0.4", features = ["serde"] }

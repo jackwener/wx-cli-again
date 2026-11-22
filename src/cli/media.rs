@@ -10,7 +10,7 @@ use crate::crypto::sqlcipher;
 pub fn cmd_voice_export(svr_id: i64, chat: Option<String>, output: String) -> Result<()> {
     let cfg = config::load_config().context("请先 wx init")?;
     let keys: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&cfg.keys_file).context("读取密钥失败")?)?;
+        serde_json::from_str(&crate::private_fs::read_private(&cfg.keys_file).context("读取密钥失败")?)?;
 
     // 候选 media 库
     let mut candidates: Vec<(PathBuf, String)> = Vec::new();
@@ -86,7 +86,7 @@ pub fn cmd_voice_export(svr_id: i64, chat: Option<String>, output: String) -> Re
             if data.is_empty() {
                 continue;
             }
-            std::fs::write(&out, &data)?;
+            crate::private_fs::write_private(&out, &data)?;
             println!(
                 "已导出 {} 字节 → {} (from {})",
                 data.len(),

@@ -2214,10 +2214,25 @@ fn get_content_bytes(row: &rusqlite::Row<'_>, idx: usize) -> Vec<u8> {
         .unwrap_or_default()
 }
 
+// Prevent compressed message blobs from exhausting the daemon's memory.
+const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+
+fn decompress_message_bytes(data: &[u8]) -> std::io::Result<Vec<u8>> {
+    use std::io::{Error, ErrorKind, Read};
+    let mut decoder = zstd::stream::read::Decoder::new(data)?;
+    decoder.window_log_max(24)?;
+    let mut output = Vec::new();
+    decoder.take((MAX_MESSAGE_BYTES + 1) as u64).read_to_end(&mut output)?;
+    if output.len() > MAX_MESSAGE_BYTES {
+        return Err(Error::new(ErrorKind::InvalidData, "解压后的单条消息超过 16 MiB"));
+    }
+    Ok(output)
+}
+
 fn decompress_message(data: &[u8], ct: i64) -> String {
     if ct == 4 && !data.is_empty() {
         // zstd 压缩
-        if let Ok(dec) = zstd::decode_all(data) {
+        if let Ok(dec) = decompress_message_bytes(data) {
             return String::from_utf8_lossy(&dec).into_owned();
         }
     }
@@ -2229,7 +2244,7 @@ fn decompress_or_str(data: &[u8]) -> String {
         return String::new();
     }
     // 尝试 zstd 解压
-    if let Ok(dec) = zstd::decode_all(data) {
+    if let Ok(dec) = decompress_message_bytes(data) {
         if let Ok(s) = String::from_utf8(dec) {
             return s;
         }
@@ -5341,7 +5356,7 @@ pub async fn q_extract(
         let decoded = decoder::dispatch(&dat_bytes, v2_key)?;
 
         // 写盘
-        std::fs::write(&output_path2, &decoded.data)
+        crate::private_fs::write_output(&output_path2, &decoded.data, overwrite)
             .with_context(|| format!("写出文件失败：{}", output_path2.display()))?;
 
         // 注意：不要在这里塞 `ok: true`。dispatch 会用 Response::ok(v) 包一层，
@@ -6048,5 +6063,21 @@ mod sns_tests {
         assert_eq!(item.get("width").and_then(Value::as_i64), Some(640));
         assert_eq!(item.get("height").and_then(Value::as_i64), Some(480));
         assert!(!item.contains_key("total_size"));
+    }
+}
+
+#[cfg(test)]
+mod decompression_security_tests {
+    use super::*;
+
+    #[test]
+    fn compressed_message_limit_preserves_small_messages_and_rejects_bombs() {
+        let small = zstd::encode_all("中文 synthetic message".as_bytes(), 1).unwrap();
+        assert_eq!(decompress_message(&small, 4), "中文 synthetic message");
+        let oversized = vec![b'x'; MAX_MESSAGE_BYTES + 1];
+        let compressed = zstd::encode_all(oversized.as_slice(), 1).unwrap();
+        assert!(decompress_message_bytes(&compressed).is_err());
+        assert!(decompress_message_bytes(b"not a zstd frame").is_err());
+        assert_eq!(decompress_message(b"plain text", 0), "plain text");
     }
 }

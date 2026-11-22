@@ -82,32 +82,12 @@ pub fn stop_daemon() -> Result<()> {
 /// 典型坑：旧版本 `sudo wx init` 把目录留成 root 属主，非 root 的 daemon
 /// 连 socket/log 都建不了，会静默失败 15s 超时。
 fn preflight_cli_dir_writable() -> Result<()> {
+    crate::private_fs::require_unprivileged()?;
     let cli_dir = config::cli_dir();
-    std::fs::create_dir_all(&cli_dir)
-        .with_context(|| format!("创建 {} 失败", cli_dir.display()))?;
-
-    let probe = cli_dir.join(".daemon_probe");
-    match std::fs::File::create(&probe) {
-        Ok(_) => {
-            let _ = std::fs::remove_file(&probe);
-            Ok(())
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            let dir = cli_dir.display();
-            if cfg!(unix) {
-                bail!(
-                    "无法写入 {dir}（权限不足）\n\n\
-                     这通常是老版本的 `sudo wx init` 把目录属主留成了 root。\n\
-                     修复：\n\n    \
-                     sudo chown -R $(whoami) {dir}\n\n\
-                     （新版已修复此问题，下次 init 不会再发生）",
-                )
-            } else {
-                bail!("无法写入 {dir}: {e}")
-            }
-        }
-        Err(e) => bail!("无法写入 {}: {}", cli_dir.display(), e),
-    }
+    crate::private_fs::ensure_private_dir(&cli_dir)?;
+    let _probe = tempfile::tempfile_in(&cli_dir)
+        .with_context(|| format!("数据目录不可写: {}", cli_dir.display()))?;
+    Ok(())
 }
 
 /// 启动 daemon 进程（自身二进制，设置 WX_DAEMON_MODE=1）
@@ -128,13 +108,9 @@ fn start_daemon() -> Result<()> {
         if let Some(parent) = log_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let (stdout_stdio, stderr_stdio) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .and_then(|f| f.try_clone().map(|g| (f, g)))
-            .map(|(f, g)| (std::process::Stdio::from(f), std::process::Stdio::from(g)))
-            .unwrap_or_else(|_| (std::process::Stdio::null(), std::process::Stdio::null()));
+        let log = crate::private_fs::append_private(&log_path)?;
+        let stdout_stdio = std::process::Stdio::from(log.try_clone()?);
+        let stderr_stdio = std::process::Stdio::from(log);
         let mut cmd = std::process::Command::new(&exe);
         cmd.env("WX_DAEMON_MODE", "1")
             .stdin(std::process::Stdio::null())
@@ -158,13 +134,9 @@ fn start_daemon() -> Result<()> {
         if let Some(parent) = log_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let (stdout_stdio, stderr_stdio) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .and_then(|f| f.try_clone().map(|g| (f, g)))
-            .map(|(f, g)| (std::process::Stdio::from(f), std::process::Stdio::from(g)))
-            .unwrap_or_else(|_| (std::process::Stdio::null(), std::process::Stdio::null()));
+        let log = crate::private_fs::append_private(&log_path)?;
+        let stdout_stdio = std::process::Stdio::from(log.try_clone()?);
+        let stderr_stdio = std::process::Stdio::from(log);
         let child = std::process::Command::new(&exe)
             .env("WX_DAEMON_MODE", "1")
             .stdin(std::process::Stdio::null())
@@ -203,7 +175,7 @@ fn write_pid_file(pid: u32, exe: &Path) -> Result<()> {
         exe: Some(exe.to_path_buf()),
     };
     let content = serde_json::to_string(&pid_file)?;
-    std::fs::write(config::pid_path(), content)
+    crate::private_fs::write_private(&config::pid_path(), content)
         .with_context(|| format!("写入 {} 失败", config::pid_path().display()))?;
     Ok(())
 }

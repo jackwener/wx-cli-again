@@ -57,8 +57,9 @@ pub fn run() {
 async fn async_run() -> Result<()> {
     // 确保工作目录存在
     let cli_dir = config::cli_dir();
-    tokio::fs::create_dir_all(&cli_dir).await?;
-    tokio::fs::create_dir_all(config::cache_dir()).await?;
+    crate::private_fs::require_unprivileged()?;
+    crate::private_fs::ensure_private_dir(&cli_dir)?;
+    crate::private_fs::ensure_private_dir(&config::cache_dir())?;
 
     let pid = std::process::id();
 
@@ -72,8 +73,7 @@ async fn async_run() -> Result<()> {
     eprintln!("[daemon] DB_DIR: {}", cfg.db_dir.display());
 
     // 加载密钥
-    let keys_content = tokio::fs::read_to_string(&cfg.keys_file)
-        .await
+    let keys_content = crate::private_fs::read_private(&cfg.keys_file)
         .map_err(|e| anyhow::anyhow!("读取密钥文件 {:?} 失败: {}", cfg.keys_file, e))?;
     let keys_raw: serde_json::Value = serde_json::from_str(&keys_content)?;
     let all_keys = extract_keys(&keys_raw);

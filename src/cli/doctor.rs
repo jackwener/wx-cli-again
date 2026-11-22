@@ -296,7 +296,7 @@ fn run_checks() -> Vec<Check> {
 }
 
 fn load_known_entries(keys_path: &Path) -> (usize, Vec<KeyEntry>) {
-    let content = std::fs::read_to_string(keys_path).unwrap_or_default();
+    let content = crate::private_fs::read_private(keys_path).unwrap_or_default();
     let v: serde_json::Value = serde_json::from_str(&content).unwrap_or(json!({}));
     let mut known = Vec::new();
     if let Some(obj) = v.as_object() {
@@ -352,7 +352,7 @@ fn find_wechat_pid() -> Option<u32> {
 }
 
 fn read_key_for(keys_path: &Path, rel: &str) -> Option<String> {
-    let content = std::fs::read_to_string(keys_path).ok()?;
+    let content = crate::private_fs::read_private(keys_path).ok()?;
     let v: serde_json::Value = serde_json::from_str(&content).ok()?;
     let entry = v.get(rel)?;
     if let Some(s) = entry.as_str() {

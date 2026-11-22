@@ -50,6 +50,10 @@ pub fn cmd_init(force: bool, hook_seconds: Option<u64>) -> Result<()> {
                             );
                         }
                     }
+                    #[cfg(unix)]
+                    drop_privileges_if_sudo()?;
+                    crate::private_fs::ensure_private_dir(&config::cli_dir())?;
+                    crate::private_fs::secure_existing(&keys_path)?;
                     return Ok(());
                 }
             }
@@ -105,11 +109,7 @@ pub fn cmd_init(force: bool, hook_seconds: Option<u64>) -> Result<()> {
     #[cfg(unix)]
     drop_privileges_if_sudo()?;
 
-    // 确保父目录存在（如 ~/.wx-cli/），必须在任何写入之前
-    if let Some(parent) = config_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("创建目录失败: {}", parent.display()))?;
-    }
+    crate::private_fs::ensure_private_dir(&config::cli_dir())?;
 
     // Step 3: 保存 all_keys.json（合并后的完整集合）
     let mut keys_json = serde_json::Map::new();
@@ -121,7 +121,7 @@ pub fn cmd_init(force: bool, hook_seconds: Option<u64>) -> Result<()> {
             }),
         );
     }
-    std::fs::write(&keys_file_path, serde_json::to_string_pretty(&keys_json)?)
+    crate::private_fs::write_private(&keys_file_path, serde_json::to_string_pretty(&keys_json)?)
         .context("写入 all_keys.json 失败")?;
     println!(
         "成功保存 {} 个数据库密钥（本次新匹配 {}）",
@@ -183,7 +183,7 @@ pub fn cmd_init(force: bool, hook_seconds: Option<u64>) -> Result<()> {
     cfg.entry("decrypted_dir".into())
         .or_insert_with(|| json!("decrypted"));
 
-    std::fs::write(&config_path, serde_json::to_string_pretty(&cfg)?)
+    crate::private_fs::write_private(&config_path, serde_json::to_string_pretty(&cfg)?)
         .context("写入 config.json 失败")?;
     println!("配置已保存: {}", config_path.display());
     println!("初始化完成，可以使用 wx sessions / wx history 等命令了");
@@ -299,89 +299,32 @@ fn load_existing_entries(keys_path: &Path, db_dir: &Path) -> Result<Vec<KeyEntry
     Ok(out)
 }
 
-/// 如果当前以 root 身份运行且是通过 sudo 启动的，drop 到调用用户身份，
-/// 并迁移旧版本遗留的 root 属主 `~/.wx-cli/`。
-///
-/// 只影响本进程；daemon（后续 fork）会继承调用用户身份。
+/// Scan with elevated read access, then drop all privileges before touching
+/// user-owned paths. Never recursively chown a user-controlled directory.
 #[cfg(unix)]
 fn drop_privileges_if_sudo() -> Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    use std::path::Path;
-
-    // 当前不是 root（用户直接以非 root 跑的 `wx init`）→ 什么都不做
     if unsafe { libc::geteuid() } != 0 {
         return Ok(());
     }
-
-    let sudo_uid: Option<u32> = std::env::var("SUDO_UID").ok().and_then(|s| s.parse().ok());
-    let sudo_gid: Option<u32> = std::env::var("SUDO_GID").ok().and_then(|s| s.parse().ok());
-    let (uid, gid) = match (sudo_uid, sudo_gid) {
-        (Some(u), Some(g)) if u != 0 => (u, g),
-        // 直接以 root 登陆（非 sudo），没有"调用用户"可还原 → 保持 root
-        _ => return Ok(()),
+    let uid = std::env::var("SUDO_UID").ok().and_then(|s| s.parse::<u32>().ok());
+    let gid = std::env::var("SUDO_GID").ok().and_then(|s| s.parse::<u32>().ok());
+    let (uid, gid) = match (uid, gid) {
+        (Some(u), Some(g)) if u != 0 && u != u32::MAX && g != u32::MAX => (u, g),
+        _ => bail!("无法确定 sudo 调用用户；拒绝以 root 保存密钥，请从普通用户通过 sudo 执行"),
     };
-
-    // 迁移旧版本遗留：如果 ~/.wx-cli/ 已存在且属 root，把它 chown 回调用用户，
-    // 顺便把 raw key 文件的权限也收紧到 0600（旧版默认 0644，世界可读等于泄露）。
-    // 这些必须在 setuid 之前做：chown 需要 root，chmod 也只有属主或 root 能改。
-    let cli_dir = config::cli_dir();
-    if cli_dir.exists() {
-        let _ = chown_recursive(&cli_dir, uid, gid);
-        let _ = tighten_perms(&cli_dir);
-    }
-
-    // 设置 umask，让后续 create 出来的文件/目录默认是 0600 / 0700。
     unsafe {
-        libc::umask(0o077);
-    }
-
-    // 必须先 setgid 再 setuid：一旦 uid 降下来就没法再改 gid 了。
-    unsafe {
+        // setgid does not clear supplementary groups inherited from root.
+        if libc::setgroups(0, std::ptr::null()) != 0 {
+            bail!("清除附加用户组失败: {}", std::io::Error::last_os_error());
+        }
         if libc::setgid(gid) != 0 {
-            anyhow::bail!("setgid({}) 失败: {}", gid, std::io::Error::last_os_error());
+            bail!("setgid({}) 失败: {}", gid, std::io::Error::last_os_error());
         }
         if libc::setuid(uid) != 0 {
-            anyhow::bail!("setuid({}) 失败: {}", uid, std::io::Error::last_os_error());
+            bail!("setuid({}) 失败: {}", uid, std::io::Error::last_os_error());
         }
     }
-
-    // chown 递归实现
-    fn chown_recursive(path: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
-        chown_one(path, uid, gid)?;
-        let md = std::fs::symlink_metadata(path)?;
-        if md.is_dir() {
-            for entry in std::fs::read_dir(path)? {
-                chown_recursive(&entry?.path(), uid, gid)?;
-            }
-        }
-        Ok(())
-    }
-    fn chown_one(path: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
-        let c = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL")
-        })?;
-        if unsafe { libc::chown(c.as_ptr(), uid, gid) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
-    }
-
-    /// 目录收紧到 0700，所有 *.json 文件（含 all_keys.json 这类 raw key）收紧到 0600。
-    fn tighten_perms(cli_dir: &Path) -> std::io::Result<()> {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(cli_dir, std::fs::Permissions::from_mode(0o700))?;
-        for entry in std::fs::read_dir(cli_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) == Some("json") {
-                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-            }
-        }
-        Ok(())
-    }
-
-    Ok(())
+    crate::private_fs::require_unprivileged()
 }
 
 fn find_or_create_config_path() -> std::path::PathBuf {

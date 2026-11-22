@@ -8,7 +8,7 @@ use crate::scanner::{self, KeyEntry};
 
 pub fn cmd_key_list(json: bool, show_secrets: bool) -> Result<()> {
     let cfg = config::load_config().context("请先 wx init")?;
-    let content = std::fs::read_to_string(&cfg.keys_file)
+    let content = crate::private_fs::read_private(&cfg.keys_file)
         .with_context(|| format!("读取 {}", cfg.keys_file.display()))?;
     let v: serde_json::Value = serde_json::from_str(&content)?;
     let mut known = Vec::new();
@@ -148,7 +148,7 @@ pub fn cmd_key_set(db_name: &str, enc_key: &str) -> Result<()> {
     }
     let cfg = config::load_config().context("请先 wx init")?;
     let mut map: BTreeMap<String, serde_json::Value> = if cfg.keys_file.exists() {
-        let content = std::fs::read_to_string(&cfg.keys_file)?;
+        let content = crate::private_fs::read_private(&cfg.keys_file)?;
         serde_json::from_str(&content).unwrap_or_default()
     } else {
         BTreeMap::new()
@@ -164,10 +164,8 @@ pub fn cmd_key_set(db_name: &str, enc_key: &str) -> Result<()> {
         }
     }
     map.insert(rel.clone(), json!({ "enc_key": key }));
-    if let Some(parent) = cfg.keys_file.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&cfg.keys_file, serde_json::to_string_pretty(&map)?)?;
+    crate::private_fs::ensure_private_dir(&config::cli_dir())?;
+    crate::private_fs::write_private(&cfg.keys_file, serde_json::to_string_pretty(&map)?)?;
     println!("已写入密钥: {} → {}", rel, cfg.keys_file.display());
     // try hot-reload（会 invalidate 解密缓存）
     match super::transport::send(crate::ipc::Request::ReloadConfig) {
