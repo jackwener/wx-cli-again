@@ -35,8 +35,8 @@ fn save_state(map: &HashMap<String, i64>) {
     if let Some(p) = path.parent() {
         let _ = std::fs::create_dir_all(p);
     }
-    let _ = std::fs::write(
-        path,
+    let _ = crate::private_fs::write_private(
+        &path,
         serde_json::to_string_pretty(&serde_json::json!({ "sessions": map })).unwrap_or_default(),
     );
 }

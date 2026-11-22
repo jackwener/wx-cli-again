@@ -101,7 +101,7 @@ impl DbCache {
         mtime_file: PathBuf,
         all_keys: HashMap<String, String>,
     ) -> Result<Self> {
-        tokio::fs::create_dir_all(&cache_dir).await?;
+        crate::private_fs::ensure_private_dir(&cache_dir)?;
 
         let cache = DbCache {
             db_dir,
@@ -146,7 +146,8 @@ impl DbCache {
 
     /// 打开解密产物做 cheap 校验（sqlite_master），防止错 key 粘住 CacheHit。
     fn probe_decrypted_db(path: &Path) -> Result<()> {
-        let conn = Connection::open(path)
+        crate::private_fs::secure_existing(path)?;
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("探测打开解密缓存失败: {}", path.display()))?;
         let n: i64 = conn
             .query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))
@@ -367,7 +368,8 @@ impl DbCache {
         let mut reused = 0usize;
         for (rel_key, entry) in &saved {
             let dec_path = PathBuf::from(&entry.path);
-            if !dec_path.exists() {
+            // An edited mtime index must never make us open or delete arbitrary paths.
+            if dec_path != self.cache_file_path(rel_key) || !dec_path.exists() {
                 continue;
             }
             // 跳过无法打开的旧坏缓存（错 key 时代写入的 SQLITE_HDR 垃圾）
@@ -433,10 +435,7 @@ impl DbCache {
         };
 
         if let Ok(json) = serde_json::to_string_pretty(&data) {
-            let tmp = mtime_file.with_extension("json.tmp");
-            if tokio::fs::write(&tmp, json).await.is_ok() {
-                let _ = tokio::fs::rename(&tmp, mtime_file).await;
-            }
+            let _ = crate::private_fs::write_private(mtime_file, json);
         }
     }
 
@@ -540,7 +539,7 @@ impl DbCache {
                     if tmp2.exists() {
                         let _ = std::fs::remove_file(&tmp2);
                     }
-                    std::fs::copy(&out_src, &tmp2).with_context(|| {
+                    crate::private_fs::copy_private(&out_src, &tmp2).with_context(|| {
                         format!("复制缓存到 temp 失败: {}", out_src.display())
                     })?;
                     if wal_path2.exists() {
@@ -1136,5 +1135,26 @@ mod tests {
             "restart-seed",
             "restart + WAL-only change should still reuse cached DB and avoid full_decrypt"
         );
+    }
+}
+
+#[cfg(test)]
+mod storage_security_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn forged_cache_index_cannot_delete_files_outside_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("unrelated-file");
+        std::fs::write(&victim, b"must remain intact").unwrap();
+        let cache_dir = dir.path().join("cache");
+        let index = dir.path().join("mtimes.json");
+        std::fs::write(&index, serde_json::json!({
+            "message/message_0.db": {"path": victim, "db_mt": 0, "wal_mt": 0}
+        }).to_string()).unwrap();
+        let cache = DbCache::with_dirs(dir.path().join("source"), cache_dir, index, HashMap::new())
+            .await.unwrap();
+        assert!(cache.inner.lock().await.is_empty());
+        assert_eq!(std::fs::read(victim).unwrap(), b"must remain intact");
     }
 }

@@ -471,27 +471,12 @@ fn hook_keys_via_lldb(pid: libc::pid_t, seconds: u64, allow_user: bool) -> Resul
     let lldb = find_lldb()
         .context("找不到 lldb。请安装 Xcode Command Line Tools：xcode-select --install")?;
 
-    let tmp_dir = std::env::temp_dir().join(format!("wx-cli-hook-{}", std::process::id()));
-    std::fs::create_dir_all(&tmp_dir)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp_dir, std::fs::Permissions::from_mode(0o700));
-    }
+    let hook_dir = tempfile::Builder::new().prefix("wx-cli-hook-").tempdir()?;
+    let tmp_dir = hook_dir.path();
     let script_path = tmp_dir.join("wx_hook.py");
     let keys_path = tmp_dir.join("keys.txt");
     let done_path = tmp_dir.join("done");
-    let _ = std::fs::remove_file(&keys_path);
-    let _ = std::fs::remove_file(&done_path);
-    // 预先创建空 keys 文件并收紧权限，避免 lldb 以默认 umask 写出 world-readable 密钥
-    {
-        let _ = std::fs::File::create(&keys_path);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&keys_path, std::fs::Permissions::from_mode(0o600));
-        }
-    }
+    crate::private_fs::create_new(&keys_path)?;
     std::fs::write(
         &script_path,
         lldb_hook_script(
@@ -539,7 +524,6 @@ fn hook_keys_via_lldb(pid: libc::pid_t, seconds: u64, allow_user: bool) -> Resul
                     use std::io::Read;
                     let _ = s.read_to_string(&mut stderr);
                 }
-                let _ = std::fs::remove_dir_all(&tmp_dir);
                 bail!(
                     "lldb 退出异常: {} {}",
                     status,
@@ -571,7 +555,6 @@ fn hook_keys_via_lldb(pid: libc::pid_t, seconds: u64, allow_user: bool) -> Resul
             keys.push(line);
         }
     }
-    let _ = std::fs::remove_dir_all(&tmp_dir);
     Ok(keys)
 }
 

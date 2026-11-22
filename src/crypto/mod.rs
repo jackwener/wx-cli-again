@@ -147,7 +147,7 @@ pub fn full_decrypt(db_path: &Path, out_path: &Path, enc_key: &[u8; 32]) -> Resu
         bail!("数据库文件为空: {}", db_path.display());
     }
 
-    let mut output = std::fs::File::create(out_path)?;
+    let mut output = crate::private_fs::create_new(out_path)?;
     let total_pages = (file_size + PAGE_SZ - 1) / PAGE_SZ;
     let mut page_buf = vec![0u8; PAGE_SZ];
 

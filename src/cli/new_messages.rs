@@ -34,7 +34,7 @@ fn save_state(new_state: &HashMap<String, i64>) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(
+    crate::private_fs::write_private(
         &path,
         serde_json::to_string(&serde_json::json!({ "sessions": new_state }))?,
     )?;
