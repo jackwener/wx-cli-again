@@ -339,7 +339,42 @@ pub(crate) fn is_writable_readable_page(protect: u32) -> bool {
 pub(crate) const MAX_PATTERN_BYTES: usize = 99; // x' + 96 hex + '
 const HEX_PATTERN_LEN: usize = 96; // 64(key) + 32(salt)
 
-/// 在缓冲区中搜索 WCDB 缓存的 `x'<key><salt>'` 字符串模式。
+/// 微信 4.1+（Linux 4.1.x / macOS 4.2.x 等）在 `WCDB.Config.Cipher` 中对 99 字节
+/// `x'<64hex_key><32hex_salt>'` 字面量使用的固定 32 字节循环 XOR 掩码。
+const WCDB_CIPHER_XOR_MASK: [u8; 32] = [
+    0xd2, 0xc7, 0x44, 0x24, 0x58, 0x02, 0x00, 0x00,
+    0x00, 0x48, 0x89, 0x44, 0x24, 0x50, 0x48, 0x8b,
+    0x45, 0x00, 0x48, 0x84, 0x4c, 0x24, 0x48, 0x48,
+    0x89, 0x44, 0x25, 0x40, 0x48, 0x58, 0x4c, 0x24,
+];
+const XOR_PREFIX_0: u8 = b'x' ^ WCDB_CIPHER_XOR_MASK[0];
+const XOR_PREFIX_1: u8 = b'\'' ^ WCDB_CIPHER_XOR_MASK[1];
+const XOR_SUFFIX: u8 = b'\'' ^ WCDB_CIPHER_XOR_MASK[(MAX_PATTERN_BYTES - 1) % 32];
+
+fn decode_xhex_pattern(window: &[u8], mask: Option<&[u8; 32]>) -> Option<(String, String)> {
+    debug_assert_eq!(window.len(), MAX_PATTERN_BYTES);
+    let mut lower_hex = [0u8; HEX_PATTERN_LEN];
+    for (j, out) in lower_hex.iter_mut().enumerate() {
+        let m = mask.map_or(0, |k| k[(2 + j) % k.len()]);
+        let ch = window[2 + j] ^ m;
+        if !ch.is_ascii_hexdigit() {
+            return None;
+        }
+        *out = ch.to_ascii_lowercase();
+    }
+
+    let key_hex = String::from_utf8_lossy(&lower_hex[..64]).into_owned();
+    let salt_hex = String::from_utf8_lossy(&lower_hex[64..96]).into_owned();
+    Some((key_hex, salt_hex))
+}
+
+fn push_unique_key_pattern(results: &mut Vec<(String, String)>, (key_hex, salt_hex): (String, String)) {
+    if !results.iter().any(|(k, s)| k == &key_hex && s == &salt_hex) {
+        results.push((key_hex, salt_hex));
+    }
+}
+
+/// 在缓冲区中搜索 WCDB 缓存的 `x'<key><salt>'` 字符串模式（兼容明文及 4.1+ XOR 混淆）。
 pub(crate) fn scan_key_patterns(buf: &[u8], results: &mut Vec<(String, String)>) {
     let total = MAX_PATTERN_BYTES;
     if buf.len() < total {
@@ -348,32 +383,24 @@ pub(crate) fn scan_key_patterns(buf: &[u8], results: &mut Vec<(String, String)>)
 
     let mut i = 0;
     while i + total <= buf.len() {
-        if buf[i] != b'x' || buf[i + 1] != b'\'' {
-            i += 1;
-            continue;
-        }
+        let end = i + total;
+        let matched = if buf[i] == b'x' && buf[i + 1] == b'\'' && buf[end - 1] == b'\'' {
+            decode_xhex_pattern(&buf[i..end], None)
+        } else if buf[i] == XOR_PREFIX_0
+            && buf[i + 1] == XOR_PREFIX_1
+            && buf[end - 1] == XOR_SUFFIX
+        {
+            decode_xhex_pattern(&buf[i..end], Some(&WCDB_CIPHER_XOR_MASK))
+        } else {
+            None
+        };
 
-        let hex_start = i + 2;
-        let all_hex = buf[hex_start..hex_start + HEX_PATTERN_LEN]
-            .iter()
-            .all(|&c| c.is_ascii_hexdigit());
-        if !all_hex {
+        if let Some(pair) = matched {
+            push_unique_key_pattern(results, pair);
+            i += total;
+        } else {
             i += 1;
-            continue;
         }
-        if buf[hex_start + HEX_PATTERN_LEN] != b'\'' {
-            i += 1;
-            continue;
-        }
-
-        let key_hex = String::from_utf8_lossy(&buf[hex_start..hex_start + 64]).to_lowercase();
-        let salt_hex =
-            String::from_utf8_lossy(&buf[hex_start + 64..hex_start + 96]).to_lowercase();
-        let is_dup = results.iter().any(|(k, s)| k == &key_hex && s == &salt_hex);
-        if !is_dup {
-            results.push((key_hex, salt_hex));
-        }
-        i += total;
     }
 }
 
@@ -751,6 +778,73 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, key);
         assert_eq!(results[0].1, salt);
+    }
+
+    fn xor_encode_pattern(pattern: &[u8]) -> Vec<u8> {
+        pattern
+            .iter()
+            .enumerate()
+            .map(|(i, b)| b ^ WCDB_CIPHER_XOR_MASK[i % WCDB_CIPHER_XOR_MASK.len()])
+            .collect()
+    }
+
+    #[test]
+    fn scan_key_patterns_finds_xor_obfuscated_xhex() {
+        let key = "0123456789abcdef".repeat(4);
+        let salt = "fedcba9876543210".repeat(2);
+        let plain = format!("x'{key}{salt}'");
+        let mut buf = vec![0x7au8; 17];
+        buf.extend(xor_encode_pattern(plain.as_bytes()));
+        buf.extend_from_slice(&[0xffu8; 19]);
+        let mut results = Vec::new();
+        scan_key_patterns(&buf, &mut results);
+        assert_eq!(results, vec![(key, salt)]);
+    }
+
+    #[test]
+    fn scan_key_patterns_xor_normalizes_uppercase_and_dedups_with_plaintext() {
+        let key = "a1b2c3d4e5f60718".repeat(4);
+        let salt = "89abcdef01234567".repeat(2);
+        let upper_plain = format!("x'{}{}'", key.to_ascii_uppercase(), salt.to_ascii_uppercase());
+        let mut buf = xor_encode_pattern(upper_plain.as_bytes());
+        buf.extend_from_slice(b"sep");
+        buf.extend(format!("x'{key}{salt}'").into_bytes());
+        let mut results = Vec::new();
+        scan_key_patterns(&buf, &mut results);
+        assert_eq!(results, vec![(key, salt)]);
+    }
+
+    #[test]
+    fn scan_key_patterns_xor_rejects_invalid_hex_and_suffix() {
+        let key = "ab".repeat(32);
+        let salt = "cd".repeat(16);
+        let valid = format!("x'{key}{salt}'");
+
+        let mut bad_hex = valid.as_bytes().to_vec();
+        bad_hex[10] = b'g';
+        let mut results = Vec::new();
+        scan_key_patterns(&xor_encode_pattern(&bad_hex), &mut results);
+        assert!(results.is_empty());
+
+        let mut bad_suffix = valid.into_bytes();
+        bad_suffix[MAX_PATTERN_BYTES - 1] = b'"';
+        let mut results = Vec::new();
+        scan_key_patterns(&xor_encode_pattern(&bad_suffix), &mut results);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn scan_key_patterns_finds_mixed_plaintext_and_xor() {
+        let key1 = "11".repeat(32);
+        let salt1 = "22".repeat(16);
+        let key2 = "33".repeat(32);
+        let salt2 = "44".repeat(16);
+        let mut buf = format!("x'{key1}{salt1}'").into_bytes();
+        buf.extend_from_slice(&[0x00u8; 13]);
+        buf.extend(xor_encode_pattern(format!("x'{key2}{salt2}'").as_bytes()));
+        let mut results = Vec::new();
+        scan_key_patterns(&buf, &mut results);
+        assert_eq!(results, vec![(key1, salt1), (key2, salt2)]);
     }
 
     #[test]
